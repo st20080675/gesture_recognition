@@ -1,0 +1,629 @@
+#include "Gesture_recognizer.hpp"
+
+
+#ifdef Gesture_recognition
+using namespace cv;
+Gesture_recognizer::Gesture_recognizer()
+{
+    memset(m_max_position_status, 0, sizeof(m_max_position_status));
+    memset(m_front_hand_status, 0, sizeof(m_front_hand_status));
+}
+
+Gesture_recognizer::~Gesture_recognizer(){}
+
+void Gesture_recognizer::reinitial()
+{
+    m_flag_face_detected = 0;
+    m_flag_xy_extend_hand = 0;
+    m_flag_xy_command = 0;
+    m_flag_down_command = 0;
+    m_z_command_proposal = 0;
+
+    m_command_proposal.x = 0;
+    m_command_proposal.y = 0;
+    m_command_proposal.z = 0;
+}
+
+void Gesture_recognizer::calculate_tracking_bbx_extend(const Mat& image, cv::Rect_<float> &boundingBox)
+{
+    Point2f start_point;
+    Point2f end_point;
+
+    float bx_margin_extend_col = boundingBox.width * m_bx_extend_margin(0);
+    float bx_margin_extend_row = boundingBox.height * m_bx_extend_margin(1);
+
+    float off_set_start_col = std::min(bx_margin_extend_col, boundingBox.x);
+    float off_set_start_row = std::min(bx_margin_extend_row, boundingBox.y);
+
+    start_point.x = boundingBox.x - off_set_start_col;
+    start_point.y = boundingBox.y - off_set_start_row;
+
+    m_tracking_bbx_extend.x = (int) round(start_point.x);
+    m_tracking_bbx_extend.y = (int) round(start_point.y);
+
+    end_point.x = std::min(m_tracking_bbx_extend.x+boundingBox.width*(1+2*m_bx_extend_margin(0)), (double)image.cols-1);
+    end_point.y = std::min(m_tracking_bbx_extend.y+boundingBox.height*(1+2*m_bx_extend_margin(1)), (double)image.rows-1);
+
+    m_tracking_bbx_extend.width  = (int) round(end_point.x - start_point.x);
+    m_tracking_bbx_extend.height = (int) round(end_point.y - start_point.y);
+
+}
+
+
+void Gesture_recognizer::face_detection(const Mat& image, const cv::Rect_<float> &boundingBox)
+{
+    std::string face_cascade_dir = "/opt/opencv/data/haarcascades/haarcascade_frontalface_default.xml";
+    //std::string face_cascade_dir = "/usr/local/share/OpenCV/haarcascades/haarcascade_frontalface_default.xml";
+    //std::string face_cascade_dir = "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml";
+    CascadeClassifier face_cascade;
+    if( !face_cascade.load( face_cascade_dir ) ){ printf("--(!)Error loading face cascade classifier\n"); return; };
+
+    Mat crop_image = image(m_tracking_bbx_extend);
+    Mat gray_image;
+    std::vector< cv::Rect> face_bbx_vec;
+    cvtColor(crop_image, gray_image, CV_BGR2GRAY);
+    face_cascade.detectMultiScale(gray_image, face_bbx_vec);
+
+    int face_num = face_bbx_vec.size();
+    int best_face_idx = 0;
+
+    if (face_num > 0)
+    {
+        m_flag_face_detected = 1;
+        float face_score = abs(face_bbx_vec[0].y - boundingBox.y) + abs(face_bbx_vec[0].x+face_bbx_vec[0].width/2 - m_command_center.x);
+
+
+        if (face_num > 1)
+        {
+            float temp_face_score;
+            for (int i=1; i<face_num; i++)
+            {
+                temp_face_score = abs(face_bbx_vec[i].y - boundingBox.y) + abs(face_bbx_vec[i].x+face_bbx_vec[i].width/2 - m_command_center.x);
+                if (temp_face_score < face_score)
+                {
+                    best_face_idx = i;
+                    face_score = temp_face_score;
+                }
+            }
+        }
+        m_face_bbx.x = face_bbx_vec[best_face_idx].x + m_tracking_bbx_extend.x;
+        m_face_bbx.y = face_bbx_vec[best_face_idx].y + m_tracking_bbx_extend.y;
+        m_face_bbx.width = face_bbx_vec[best_face_idx].width;
+        m_face_bbx.height = face_bbx_vec[best_face_idx].height;
+
+
+        int offset = round(m_face_bbx.width*0.3);
+        m_face_bbx_extend.x = max(0, m_face_bbx.x - offset);
+        m_face_bbx_extend.y = max(0, m_face_bbx.y - offset);
+        m_face_bbx_extend.width = min(image.cols - m_face_bbx_extend.x - 1, m_face_bbx.width + (int)round(offset*0.6));
+        m_face_bbx_extend.height = min(image.rows - m_face_bbx_extend.y - 1, m_face_bbx.height + (int)(m_face_bbx.height*0.7));
+
+
+        m_face_scale[0] = m_face_scale[1];
+        m_face_scale[1] = m_face_bbx.width;
+    }
+
+}
+
+
+void Gesture_recognizer::recalculate_bbx_and_point_using_face_bbx(const cv::Mat& image, Rect_<float> &boundingBox, float &newScale, Point_<float> &newPos)
+{
+   float temp_scaler = m_face_bbx.width*2.4/boundingBox.width;
+   newScale = newScale*temp_scaler;
+
+   boundingBox.x = max((float)(m_face_bbx.x - 0.7*m_face_bbx.width),(float)0);
+   boundingBox.y = max((float)(m_face_bbx.y - m_face_bbx.height/2),(float)0);
+   boundingBox.width = min(boundingBox.width*temp_scaler, image.cols - boundingBox.x);
+   boundingBox.height = min(boundingBox.height*temp_scaler, image.rows - boundingBox.y);
+
+
+   m_command_center = Point(boundingBox.x+boundingBox.width/2,boundingBox.y+boundingBox.height/4);
+   m_hand_size = Vec2f(boundingBox.width*m_hand_bbx_to_width_tracking_bbx, boundingBox.width*m_hand_bbx_to_width_tracking_bbx);
+   m_tracking_bbx_center = Point(boundingBox.x+boundingBox.width/2,boundingBox.y+boundingBox.height/2);
+
+   newPos.x = boundingBox.x + boundingBox.width / 2;
+   newPos.y = boundingBox.y + boundingBox.height / 2;
+
+   calculate_tracking_bbx_extend(image, boundingBox);
+
+}
+
+
+void Gesture_recognizer::skin_detection(const Mat& image, const Rect_<float> &boundingBox)
+{
+    std::ifstream skin_file("/home/sunting/Documents/program/Gesture_recognition/skindetector/skin_model_bool.txt", std::ios::in);
+    double skin_prob_map[32768];
+    for (int i = 0; i<32768; i++)
+    {
+        skin_file>>skin_prob_map[i];
+    }
+    skin_file.close();
+
+    Mat image_gray;
+    cvtColor( image, image_gray, CV_BGR2GRAY );
+
+    m_potential_hand_mask = Mat::zeros(image_gray.rows, image_gray.cols, image_gray.type());
+
+    // the skin index is: 1+floor(R/8)+floor(G/8)*32+floor(B/8)*32*32
+    // cv::Mat read in color image in BGR channel order
+
+    for (int i_col = m_tracking_bbx_extend.x; i_col < m_tracking_bbx_extend.x + m_tracking_bbx_extend.width; i_col++)
+    {
+        for (int i_row = m_tracking_bbx_extend.y; i_row < m_tracking_bbx_extend.y + m_tracking_bbx_extend.height; i_row++)
+        {
+            // opencv store color image in BGR order
+            int current_idx = (int)(floor(image.at<Vec3b>(i_row,i_col)[2]/8)+floor(image.at<Vec3b>(i_row,i_col)[1]/8)*32+floor(image.at<Vec3b>(i_row,i_col)[0]/8)*32*32);
+            m_potential_hand_mask.at<uchar>(i_row,i_col) = skin_prob_map[current_idx]*250;
+
+            // visualize in m_image_with_result
+            if (skin_prob_map[current_idx])
+            {
+                m_image_with_result.at<Vec3b>(i_row,i_col)[0] = 255;
+                m_image_with_result.at<Vec3b>(i_row,i_col)[1] = 0;
+                m_image_with_result.at<Vec3b>(i_row,i_col)[2] = 0;
+            }
+
+        }
+
+    }
+
+    //remove the potential feet skin region
+    Rect feet_region_in_tracking_bbx;
+    feet_region_in_tracking_bbx.x = boundingBox.x;
+    feet_region_in_tracking_bbx.width = min((int)boundingBox.width-1, image.cols - feet_region_in_tracking_bbx.x);
+    feet_region_in_tracking_bbx.y = boundingBox.y + (int)floor(boundingBox.height*4/7);
+    feet_region_in_tracking_bbx.height = image.rows-feet_region_in_tracking_bbx.y;
+
+    if(feet_region_in_tracking_bbx.x>0 && feet_region_in_tracking_bbx.y>0 && feet_region_in_tracking_bbx.width>0 && feet_region_in_tracking_bbx.height>0)
+    {
+        Mat temp_patch_feet = Mat::zeros(feet_region_in_tracking_bbx.height, feet_region_in_tracking_bbx.width, m_potential_hand_mask.type());
+        temp_patch_feet.copyTo(m_potential_hand_mask(feet_region_in_tracking_bbx));
+        image(feet_region_in_tracking_bbx).copyTo(m_image_with_result(feet_region_in_tracking_bbx));
+    }
+
+
+
+    //fill in the holes
+    Mat im_floodfill = m_potential_hand_mask.clone();
+    floodFill(im_floodfill, Point(0,0), Scalar(255));
+    Mat im_floodfill_inv;
+    bitwise_not(im_floodfill,im_floodfill_inv);
+    im_floodfill = (m_potential_hand_mask | im_floodfill_inv);
+    m_potential_hand_mask = im_floodfill;
+
+    // remove face region
+    if (m_flag_face_detected)
+    {
+        Mat temp_patch = Mat::zeros(m_face_bbx_extend.height, m_face_bbx_extend.width, m_potential_hand_mask.type());
+        temp_patch.copyTo(m_potential_hand_mask(m_face_bbx_extend));
+        image(m_face_bbx_extend).copyTo(m_image_with_result(m_face_bbx_extend));
+    }
+    else
+    {
+        /*
+        int face_size = (int)boundingBox.width/2.4;
+        int offset = round(face_size*0.3);
+        m_face_bbx_extend.x = max(0, (int)(boundingBox.x + face_size*0.7 - offset));
+        m_face_bbx_extend.y = max((int)boundingBox.y, 0);
+        m_face_bbx_extend.width = min(image.cols - m_face_bbx_extend.x - 1, face_size + (int)round(offset*2));
+        m_face_bbx_extend.height = min(image.rows - m_face_bbx_extend.y - 1, face_size + (int)(offset*3));
+        */
+
+        m_face_bbx_extend.x = max((int)boundingBox.x, 0);
+        m_face_bbx_extend.y = max((int)boundingBox.y, 0);
+        m_face_bbx_extend.width = min(boundingBox.width, float(image.cols - m_face_bbx_extend.x));
+        m_face_bbx_extend.height = min(float(boundingBox.height / 3.2), float(image.rows - m_face_bbx_extend.y)); //An average person, is generally 7-and-a-half heads tall (including the head).
+
+        Mat temp_patch = Mat::zeros(m_face_bbx_extend.height, m_face_bbx_extend.width, m_potential_hand_mask.type());
+        temp_patch.copyTo(m_potential_hand_mask(m_face_bbx_extend));
+        image(m_face_bbx_extend).copyTo(m_image_with_result(m_face_bbx_extend));
+    }
+
+}
+
+
+//*** calculate optical flow block code *****************************
+static void drawOptFlowMap(const Mat& flow, Mat& cflowmap, int step,
+                    double, const Scalar& color)
+{
+    for(int y = 0; y < cflowmap.rows; y += step)
+        for(int x = 0; x < cflowmap.cols; x += step)
+        {
+            const Point2f& fxy = flow.at<Point2f>(y, x);
+            line(cflowmap, Point(x,y), Point(cvRound(x+fxy.x), cvRound(y+fxy.y)),
+                 color);
+            circle(cflowmap, Point(x,y), 2, color, -1);
+        }
+}
+
+
+void Gesture_recognizer::calculate_optical_flow(const Mat& image)
+{
+
+    m_max_body_height = image.rows/2;
+    m_max_body_width = image.cols/2;
+
+    Mat crop_frame;
+    //UMat gray_crop(m_max_body_height, m_max_body_width, CV_32FC1), gray_crop_temp;
+    UMat gray_crop_temp, gray_crop = UMat::zeros(m_max_body_height, m_max_body_width, CV_32FC1);
+    Rect flow_bbx_in_frame, flow_bbx_in_max_crop;
+
+    flow_bbx_in_frame.x = max(0, (int)m_tracking_bbx_center.x - m_max_body_width/2);
+    flow_bbx_in_frame.y = max(0, (int)m_tracking_bbx_center.y - m_max_body_height/2);
+    flow_bbx_in_frame.width = min(m_max_body_width, image.cols-flow_bbx_in_frame.x-1);
+    flow_bbx_in_frame.height = min(m_max_body_height, image.rows-flow_bbx_in_frame.y-1);
+
+    flow_bbx_in_max_crop.x = 0;
+    flow_bbx_in_max_crop.y = 0;
+    flow_bbx_in_max_crop.width = flow_bbx_in_frame.width;
+    flow_bbx_in_max_crop.height = flow_bbx_in_frame.height;
+
+    if (flow_bbx_in_max_crop.width == m_max_body_width && flow_bbx_in_max_crop.height == m_max_body_height)
+    {
+        crop_frame = image(flow_bbx_in_frame);
+        cvtColor(crop_frame, gray_crop_temp, COLOR_BGR2GRAY);
+        gray_crop_temp.copyTo(gray_crop(flow_bbx_in_max_crop));
+
+        if (!m_prev_gray_crop.empty())
+        {
+            calcOpticalFlowFarneback(m_prev_gray_crop, gray_crop, m_flow_crop, 0.5, 3, 15, 3, 5, 1.2, 0);
+
+            m_flow = Mat::zeros(image.rows, image.cols, CV_32FC2);
+            Mat flow_temp = Mat::zeros(image.rows, image.cols, CV_32FC2);
+            m_flow_crop(flow_bbx_in_max_crop).copyTo(flow_temp(flow_bbx_in_frame));
+
+            flow_temp.copyTo(m_flow, m_potential_hand_mask);
+
+            namedWindow("flow", 1);
+            drawOptFlowMap(m_flow, m_image_with_result, 8, 1.5, Scalar(0, 255, 0));
+            imshow("flow", m_image_with_result);
+
+        }
+        std::swap(m_prev_gray_crop, gray_crop);
+    }
+}
+
+// ***** end of calculate optical flow block code *****************************
+
+void Gesture_recognizer::state_buffer_management()
+{
+    float scaler = 1;
+    // shift the state buffer
+    for (int i_state = 59; i_state > 0; i_state--)
+    {
+        m_max_position_status[i_state][0] = m_max_position_status[i_state-1][0];
+        m_max_position_status[i_state][1] = m_max_position_status[i_state-1][1];
+        m_max_position_status[i_state][2] = m_max_position_status[i_state-1][2];
+
+        m_front_hand_status[i_state][0] = m_front_hand_status[i_state-1][0];
+        m_front_hand_status[i_state][1] = m_front_hand_status[i_state-1][1];
+        m_front_hand_status[i_state][2] = m_front_hand_status[i_state-1][2];
+    }
+
+    if (m_face_scale[0]!=0 && m_flag_face_detected)
+    {
+        scaler = m_face_scale[1]/m_face_scale[0];
+    }
+    else if (m_tracking_scale[0])
+    {
+        scaler = m_tracking_scale[1]/m_tracking_scale[0];
+    }
+
+    for (int i_state = 0; i_state < 60; i_state++)
+    {
+        m_max_position_status[i_state][0] = m_max_position_status[i_state][0]*scaler;
+        m_max_position_status[i_state][1] = m_max_position_status[i_state][1]*scaler;
+        m_max_position_status[i_state][2] = m_max_position_status[i_state][2]*scaler;
+
+        m_front_hand_status[i_state][0] = m_front_hand_status[i_state][0]*scaler;
+        m_front_hand_status[i_state][1] = m_front_hand_status[i_state][1]*scaler;
+        m_front_hand_status[i_state][2] = m_front_hand_status[i_state][2]*scaler;
+    }
+}
+
+
+void Gesture_recognizer::hand_detection(const Rect_<float> &boundingBox)
+{
+    // for hand stretch out the tracking boundingBox
+    Mat potential_hand_mask_out_tracking_bbx;
+    m_potential_hand_mask.copyTo(potential_hand_mask_out_tracking_bbx);
+
+    Rect valid_boundingBox;
+    valid_boundingBox.x = max((int)boundingBox.x, 0);
+    valid_boundingBox.y = max((int)boundingBox.y, 0);
+    valid_boundingBox.width = min((int)boundingBox.width, m_potential_hand_mask.cols-valid_boundingBox.x-1);
+    valid_boundingBox.height = min((int)boundingBox.height, m_potential_hand_mask.rows-valid_boundingBox.y-1);
+
+    int temp = countNonZero(m_potential_hand_mask);
+    potential_hand_mask_out_tracking_bbx(valid_boundingBox) = 0;
+    temp = countNonZero(m_potential_hand_mask);
+
+    if (countNonZero(potential_hand_mask_out_tracking_bbx)>30)
+    {
+        double current_max_score = -1.0/0.0;
+        for (int i_col = m_tracking_bbx_extend.x; i_col < m_tracking_bbx_extend.x + m_tracking_bbx_extend.width; i_col++)
+        {
+            for (int i_row = m_tracking_bbx_extend.y; i_row < m_tracking_bbx_extend.y + m_tracking_bbx_extend.height; i_row++)
+            {
+                if(potential_hand_mask_out_tracking_bbx.at<uchar>(i_row,i_col))
+                {
+                    Rect hand_bbx(i_col, i_row, min((int)m_hand_size[0],m_potential_hand_mask.cols-i_col-1), min((int)m_hand_size[1],m_potential_hand_mask.rows-i_row-1));
+                    int temp_skin_scroe = countNonZero(potential_hand_mask_out_tracking_bbx(hand_bbx));
+                    float current_score = abs(i_col-m_command_center.x)+min(m_command_center.y-i_row, 0)*0.2+temp_skin_scroe*m_skin_weight_static;
+                    if ((current_score > current_max_score) && (temp_skin_scroe > 7) && ((abs(i_col+m_hand_size[0]/2-m_command_center.x)>boundingBox.width/1.5) || (i_row-m_command_center.y < -boundingBox.width)))
+                    {
+                        m_flag_xy_extend_hand = 1;
+                        m_max_position_status[0][0] = i_col-m_command_center.x;
+                        m_max_position_status[0][1] = i_row-m_command_center.y;
+                        m_max_position_status[0][2] = temp_skin_scroe;
+                        current_max_score = current_score;
+                    }
+
+                }
+            }
+        }
+    }
+
+    if (!m_flag_xy_extend_hand)
+    {
+        m_max_position_status[0][0] = 0;
+        m_max_position_status[0][1] = 0;
+        m_max_position_status[0][2] = 0;
+    }
+    else
+    {
+        m_front_hand_status[0][0] = 0;
+        m_front_hand_status[0][1] = 0;
+        m_front_hand_status[0][2] = 0;
+    }
+
+    // for hand in front of the body
+    if (!m_flag_xy_extend_hand)
+    {
+        double current_max_score = -1.0/0.0;
+        UMat potential_hand_mask_within_tracking_bbx= UMat::zeros(m_potential_hand_mask.rows, m_potential_hand_mask.cols, CV_32FC1);
+        m_potential_hand_mask(valid_boundingBox).copyTo(potential_hand_mask_within_tracking_bbx(valid_boundingBox));
+
+        for (int i_col = valid_boundingBox.x; i_col < valid_boundingBox.x + valid_boundingBox.width; i_col++)
+        {
+            for (int i_row = valid_boundingBox.y; i_row < valid_boundingBox.y + (int)valid_boundingBox.height*4/7; i_row++)
+            {
+                Rect hand_bbx(i_col, i_row, min((int)m_hand_size[0],m_potential_hand_mask.cols-i_col-1), min((int)m_hand_size[1],m_potential_hand_mask.rows-i_row-1));
+                int temp_skin_scroe = countNonZero(potential_hand_mask_within_tracking_bbx(hand_bbx));
+
+                float temp_flow_score = 0;
+                float dist_cost = 0;
+
+                if (m_flow.cols > 0 && m_flag_use_opt_flow)
+                {
+                    Point2f temp_sum_flow(0, 0);
+                    for (int ii_col = hand_bbx.x; ii_col<hand_bbx.x+hand_bbx.width-2; ii_col++)
+                    {
+                        for(int ii_row = hand_bbx.y; ii_row<hand_bbx.y+hand_bbx.height-2; ii_row++)
+                        {
+                            temp_sum_flow = temp_sum_flow + m_flow.at<Point2f>(ii_row, ii_col);
+                        }
+                    }
+                    temp_flow_score = sqrt(pow(temp_sum_flow.x,2)+pow(temp_sum_flow.y,2));
+                }
+
+                dist_cost = abs((i_col + ((float)hand_bbx.width)/2 - m_tracking_bbx_center.x));  //*(i_col + ((float)hand_bbx.width)/2 - m_tracking_bbx_center.x)+(i_row + ((float)hand_bbx.height)/2 - m_tracking_bbx_center.y)*(i_row + ((float)hand_bbx.height)/2 - m_tracking_bbx_center.y));
+                float current_score = temp_flow_score + temp_skin_scroe*m_skin_weight_motion - dist_cost;
+                if (current_score>current_max_score && dist_cost < boundingBox.width / 5 && temp_skin_scroe > 30)
+                {
+                    m_front_hand_status[0][0] = i_col-m_tracking_bbx_center.x;
+                    //m_front_hand_status[0][1] = i_row-m_tracking_bbx_center.y;
+                    m_front_hand_status[0][1] = i_row - (boundingBox.y + boundingBox.height * 0.442d);
+                    m_front_hand_status[0][2] = temp_skin_scroe;
+                    current_max_score = current_score;
+                }
+
+            }
+
+        }
+
+    }
+
+}
+
+
+
+void Gesture_recognizer::command_generator(const cv::Rect_<float> &boundingBox)
+{
+    //decision tree
+    int obvious_count = 0;
+
+    for(int i_state = 0; i_state < 60; i_state++)
+    {
+        if ((abs(m_max_position_status[i_state][0]+m_hand_size[0]/2)>boundingBox.width/1.5) || (m_max_position_status[i_state][1]< -boundingBox.width))
+        {
+            obvious_count++;
+            m_command_proposal.x = m_command_proposal.x + m_max_position_status[i_state][0]+m_hand_size[0]/2;
+            m_command_proposal.y = m_command_proposal.y + m_max_position_status[i_state][1];
+        }
+    }
+
+
+    if (obvious_count >= 30)
+    {
+        m_command_proposal = m_command_proposal/obvious_count;
+        m_flag_xy_command = 1;
+    }
+    else // check z-command
+    {
+        int front_hand_up = 0;
+        int front_hand_down = 0;
+
+        for (int i_state = 0; i_state < 60; i_state++)
+        {
+            if (m_front_hand_status[i_state][0] || m_front_hand_status[i_state][1])
+            {
+                if (m_front_hand_status[i_state][1] < 0)
+                {
+                    front_hand_up++;
+                }
+                else
+                {
+                    front_hand_down++;
+                }
+            }
+        }
+
+        if (front_hand_up > 30)
+        {
+            m_z_command_proposal = -1;  // come closer
+            m_command_proposal.z = -1;
+        }
+        else if (front_hand_down > 30)
+        {
+            m_z_command_proposal = 1; // go further
+            m_command_proposal.z = 1;
+        }
+        else
+        {
+            m_z_command_proposal = 0;
+            m_command_proposal.z = 0;
+        }
+
+
+    }
+
+}
+
+
+
+void Gesture_recognizer::command_regularization()
+{
+    if (m_flag_xy_command)
+    {
+        if (abs(m_command_proposal.y) > abs(m_command_proposal.x)*0.5)
+        {
+            m_command_proposal.x = 0;
+
+            if (m_command_proposal.y > 0)
+            {
+                m_flag_down_command = 1;
+            }
+        }
+    }
+}
+
+
+
+
+void Gesture_recognizer::drawCommand(const Rect_<float> &boundingBox)
+{
+    namedWindow( "skin probability", WINDOW_AUTOSIZE );
+    imshow("skin probability",m_potential_hand_mask);
+
+    namedWindow( "image with result", WINDOW_AUTOSIZE );
+    if (m_flag_face_detected)
+    {
+        rectangle(m_image_with_result, m_face_bbx, Scalar(0,0,255));
+    }
+
+    rectangle(m_image_with_result, boundingBox, Scalar(0,0,255));
+    rectangle(m_image_with_result, m_tracking_bbx_extend, Scalar(0,0,255));
+
+    drawMarker(m_image_with_result, m_command_center, Scalar(0,0,255), MARKER_STAR, 5, 1.5);
+    drawMarker(m_image_with_result, m_tracking_bbx_center, Scalar(0,0,255), MARKER_STAR, 5, 2);
+
+    if (m_max_position_status[0][0]||m_max_position_status[0][1])
+    {
+        Rect hand_bbx_xy(m_max_position_status[0][0]+m_command_center.x, m_max_position_status[0][1]+m_command_center.y, m_hand_size[0], m_hand_size[1]);
+        rectangle(m_image_with_result, hand_bbx_xy, Scalar(0,0,255), 1.5);   // stretch out hand bbx
+    }
+
+    if (m_front_hand_status[0][0] || m_front_hand_status[0][1])
+    {
+        Rect hand_bbx_front(m_front_hand_status[0][0]+m_tracking_bbx_center.x, m_front_hand_status[0][1]+m_tracking_bbx_center.y, m_hand_size[0], m_hand_size[1]);
+        rectangle(m_image_with_result, hand_bbx_front, Scalar(0,0,255), 1.5);   // front hand bbx
+    }
+
+
+    if (m_flag_xy_command||m_flag_down_command)
+    {
+        Point arrow_start(m_max_position_status[0][0]+m_command_center.x, m_max_position_status[0][1]+m_command_center.y);
+        Point arrow_end(m_max_position_status[0][0]+m_command_center.x+m_command_proposal.x, m_max_position_status[0][1]+m_command_center.y+m_command_proposal.y);
+        arrowedLine(m_image_with_result, arrow_start, arrow_end, Scalar(0,0,255), 2);
+    }
+    else
+    {
+        if (m_z_command_proposal == 1)
+        {
+            circle(m_image_with_result, m_command_center, boundingBox.width/6, Scalar(0,0,255), 2);
+        }
+        if (m_z_command_proposal == -1)
+        {
+            drawMarker(m_image_with_result, m_command_center, Scalar(0,0,255), MARKER_CROSS, (int)boundingBox.width/2, 2);
+        }
+
+    }
+    imshow("image with result",m_image_with_result);
+}
+
+
+
+
+void Gesture_recognizer::run(const Mat &image, Rect_<float> &boundingBox, float &newScale, Point_<float> &newPos)
+{
+    image.copyTo(m_image_with_result);
+    reinitial();
+    calculate_tracking_bbx_extend(image, boundingBox);
+    m_tracking_bbx_center = Point(boundingBox.x+boundingBox.width/2,boundingBox.y+boundingBox.height/2);
+    m_command_center = Point(boundingBox.x+boundingBox.width/2,boundingBox.y+boundingBox.height/4);
+    m_hand_size = Vec2f(boundingBox.width*m_hand_bbx_to_width_tracking_bbx, boundingBox.width*m_hand_bbx_to_width_tracking_bbx);
+
+
+    //auto begin = std::chrono::high_resolution_clock::now();
+
+    //std::thread processFaceDetection(&Gesture_recognizer::face_detection, this, image, boundingBox);
+    //face_detection(image, boundingBox);
+    skin_detection(image, boundingBox);
+    //std::thread processOptFlow(&Gesture_recognizer::calculate_optical_flow, this, image);
+
+    if (m_flag_use_opt_flow)
+    {
+        calculate_optical_flow(image);
+    }
+
+    //processFaceDetection.join();
+    //processOptFlow.join();
+    //auto end = std::chrono::high_resolution_clock::now();
+    //std::cout << "the time cost for face detection, skin detection and optical flow calculation is: " << std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count() << "ns" << std::endl;
+
+#ifdef  write_time_to_file // **************** write to the file **********************
+    std::ofstream time_file;
+    time_file.open("/home/sunting/Documents/program/cf_tracking_parallel/result/face_skin_det_opt_flow_time.txt",std::ios::app);
+    time_file << std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count() << std::endl;
+    time_file.close();
+#endif // ********************* end of writing file ********************************
+
+    //if (m_flag_face_detected) recalculate_bbx_and_point_using_face_bbx(image, boundingBox, newScale, newPos);
+
+    //begin = std::chrono::high_resolution_clock::now();
+
+    m_tracking_scale[0] = m_tracking_scale[1];
+    m_tracking_scale[1] = newScale;
+
+    state_buffer_management();
+    hand_detection(boundingBox);
+    command_generator(boundingBox);
+    command_regularization();
+    //end = std::chrono::high_resolution_clock::now();
+    //std::cout << "the time cost for state buffer management, hand detection, command generator is: " << std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count() << "ns" << std::endl;
+
+#ifdef  write_time_to_file // **************** write to the file **********************
+    time_file.open("/home/sunting/Documents/program/cf_tracking_parallel/result/buffer_hand_det_com_gen_time.txt",std::ios::app);
+    time_file << std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count() << std::endl;
+    time_file.close();
+#endif // ********************* end of writing file ********************************
+
+    drawCommand(boundingBox);
+}
+
+
+
+
+
+#endif
